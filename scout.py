@@ -352,7 +352,9 @@ def src_ats():
                 if not INTERNISH.search(title):
                     continue
                 term = " ".join(re.findall(r"(?i)(?:winter|summer|fall|spring)\s*20\d\d|\d{1,2}\s*(?:-|to|or)?\s*\d{0,2}\s*-?\s*months?", title + " " + strip_html(body)[:3000]))
-                out.append(make(kind, names[tok], title, loc, term, posted, url, trim_jd(body)))
+                p = make(kind, names[tok], title, loc, term, posted, url)
+                p["_full"] = strip_html(body)      # read by enrich(), never saved
+                out.append(p)
     return out
 
 def src_hn():
@@ -374,7 +376,9 @@ def src_hn():
         parts = [s.strip() for s in head.split("|")]
         company = parts[0][:60] if parts else "HN"
         loc = next((s for s in parts if CA.search(s) or REMOTE.search(s) or US.search(s)), "")
-        out.append(make("hn", company, "Intern (HN Who is Hiring)", loc, " ".join(months_in(txt) and [f"{m} months" for m in months_in(txt)]), TODAY, f"https://news.ycombinator.com/item?id={c['id']}", trim_jd(txt, 600)))
+        p = make("hn", company, "Intern (HN Who is Hiring)", loc, " ".join(months_in(txt) and [f"{m} months" for m in months_in(txt)]), TODAY, f"https://news.ycombinator.com/item?id={c['id']}")
+        p["_full"] = txt                    # the comment is the posting
+        out.append(p)
     state["done"] = month
     save("state/hn.json", state)
     return out
@@ -409,54 +413,225 @@ def src_interninsider():
     return out
 
 
-# ---------- enrichment for list sources (no JD) + dead-page check ----------
+# ---------- posting pages: full text, work term, requirement blockers ----------
+# Every posting that passes the title/location/term rules gets its own page read (JSON APIs where the
+# board has one). From the full text we pull the stated work term and the requirement lines into a
+# ~500-char summary for Claude, and drop postings that ask for things a 1A student can't have.
 WD = re.compile(r"https://([\w-]+)\.(wd\d+)\.myworkdayjobs\.com/(?:[a-z]{2}-[A-Z]{2}/)?([^/]+)/job/(.+)")
-def enrich(p):
-    u = p["u"]
-    if not u or p["jd"]:
-        return p
-    try:
-        m = WD.match(u.split("?")[0])
-        if m:
-            d, _ = get(f"https://{m[1]}.{m[2]}.myworkdayjobs.com/wday/cxs/{m[1]}/{m[3]}/job/{m[4]}", as_json=True,
-                       headers={"Accept": "application/json", "Accept-Language": "en-US"})
-            info = d.get("jobPostingInfo") or {}
-            p["jd"] = trim_jd(info.get("title", "") + ". " + info.get("jobDescription", ""), 1200)
-            return p
-        bb = re.match(r"https://([\w-]+)\.bamboohr\.com/careers/(\d+)", u)
-        if bb:
-            d, _ = get(f"https://{bb[1]}.bamboohr.com/careers/{bb[2]}/detail", as_json=True, headers={"Accept": "application/json"})
-            jo = (d.get("result") or {}).get("jobOpening") or {}
-            p["jd"] = trim_jd(jo.get("jobOpeningName", "") + ". " + jo.get("description", ""), 1200)
-            return p
-        oc = re.match(r"(https://[\w.-]+\.oraclecloud\.com)/hcmUI/CandidateExperience/[\w-]+/sites/([\w-]+)/job/(\d+)", u)
-        if oc:
-            api = (f"{oc[1]}/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails?expand=all&onlyData=true"
-                   f"&finder=ById;Id=%22{oc[3]}%22,siteNumber={oc[2]}")
-            d, _ = get(api, as_json=True, headers={"Accept": "application/json"})
-            it = (d.get("items") or [{}])[0]
-            p["jd"] = trim_jd(" ".join(str(it.get(k) or "") for k in ("Title", "ExternalDescriptionStr", "ExternalResponsibilitiesStr", "ExternalQualificationsStr")), 1200)
-            return p
-        gh = re.search(r"greenhouse\.io/(?:embed/job_app\?for=)?([\w-]+)/jobs/(\d+)", u)
-        if gh:
-            d, _ = get(f"https://boards-api.greenhouse.io/v1/boards/{gh[1]}/jobs/{gh[2]}", as_json=True)
-            p["jd"] = trim_jd(html.unescape(d.get("content", "")))
-            return p
-        lv = re.search(r"jobs\.lever\.co/([\w-]+)/([0-9a-f-]{36})", u)
-        if lv:
-            d, _ = get(f"https://api.lever.co/v0/postings/{lv[1]}/{lv[2]}", as_json=True)
-            p["jd"] = trim_jd((d.get("descriptionPlain") or "") + " " + " ".join(strip_html(l.get("content", "")) for l in d.get("lists") or []))
-            return p
+ATS_HOST = re.compile(r"(?i)myworkdayjobs\.com|bamboohr\.com|oraclecloud\.com|greenhouse\.io|lever\.co|ashbyhq\.com|smartrecruiters\.com|ultipro\.(ca|com)|icims\.com")
+
+def _ld_json(page):
+    """schema.org JobPosting embedded in many career pages (iCIMS, Jobvite, company sites)."""
+    for blk in re.findall(r'(?is)<script[^>]+application/ld\+json[^>]*>(.*?)</script>', page):
+        try:
+            d = json.loads(blk.strip())
+        except ValueError:
+            continue
+        for x in (d if isinstance(d, list) else d.get("@graph", [d])):
+            if isinstance(x, dict) and x.get("description"):
+                return " ".join(str(x.get(k) or "") for k in ("title", "description", "qualifications", "experienceRequirements", "educationRequirements"))
+    return ""
+
+def page_text(u):
+    """Full plain text of a posting, or "" if it can't be read. Sets nothing; may raise HTTPError."""
+    if u and not ATS_HOST.search(u):        # aggregator redirects (coawp.com/go, ...) -> the real page
         page, final = get(u, timeout=20)
-        p["u"] = final if "coawp.com/go" in u else u
-        if re.search(r"(?i)(no longer (accepting|available)|position (has been )?(filled|closed)|job (is )?(closed|expired)|page not found)", page[:20000]):
-            p["dead"] = True
-        p["jd"] = trim_jd(page)
+        if ATS_HOST.search(final):
+            u = final
+        else:
+            return final, (strip_html(_ld_json(page)) or strip_html(page))
+    m = WD.match(u.split("?")[0])
+    if m:
+        d, _ = get(f"https://{m[1]}.{m[2]}.myworkdayjobs.com/wday/cxs/{m[1]}/{m[3]}/job/{m[4]}", as_json=True,
+                   headers={"Accept": "application/json", "Accept-Language": "en-US"})
+        info = d.get("jobPostingInfo") or {}
+        return u, strip_html(info.get("title", "") + ".\n" + (info.get("timeType") or "") + "\n" + info.get("jobDescription", ""))
+    bb = re.match(r"https://([\w-]+)\.bamboohr\.com/careers/(\d+)", u)
+    if bb:
+        d, _ = get(f"https://{bb[1]}.bamboohr.com/careers/{bb[2]}/detail", as_json=True, headers={"Accept": "application/json"})
+        jo = (d.get("result") or {}).get("jobOpening") or {}
+        return u, strip_html(jo.get("jobOpeningName", "") + ".\n" + (jo.get("description") or ""))
+    oc = re.match(r"(https://[\w.-]+\.oraclecloud\.com)/hcmUI/CandidateExperience/[\w-]+/sites/([\w-]+)/job/(\d+)", u)
+    if oc:
+        api = (f"{oc[1]}/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails?expand=all&onlyData=true"
+               f"&finder=ById;Id=%22{oc[3]}%22,siteNumber={oc[2]}")
+        d, _ = get(api, as_json=True, headers={"Accept": "application/json"})
+        it = (d.get("items") or [{}])[0]
+        return u, strip_html("\n".join(str(it.get(k) or "") for k in ("Title", "ExternalDescriptionStr", "ExternalResponsibilitiesStr", "ExternalQualificationsStr")))
+    gh = re.search(r"greenhouse\.io/(?:embed/job_app\?for=)?([\w-]+)/jobs/(\d+)", u)
+    if gh:
+        d, _ = get(f"https://boards-api.greenhouse.io/v1/boards/{gh[1]}/jobs/{gh[2]}", as_json=True)
+        return u, strip_html(d.get("title", "") + ".\n" + html.unescape(d.get("content", "")))
+    lv = re.search(r"jobs\.lever\.co/([\w-]+)/([0-9a-f-]{36})", u)
+    if lv:
+        d, _ = get(f"https://api.lever.co/v0/postings/{lv[1]}/{lv[2]}", as_json=True)
+        lists = "\n".join(l.get("text", "") + "\n" + strip_html(l.get("content", "")) for l in d.get("lists") or [])
+        return u, (d.get("text") or "") + ".\n" + (d.get("descriptionPlain") or "") + "\n" + lists + "\n" + (d.get("additionalPlain") or "")
+    ab = re.search(r"jobs\.ashbyhq\.com/([^/?#]+)/([0-9a-f-]{36})", u)
+    if ab:
+        d, _ = get(f"https://api.ashbyhq.com/posting-api/job-board/{ab[1]}", as_json=True)
+        j = next((j for j in d.get("jobs", []) if j.get("id") == ab[2]), None)
+        if not j:
+            raise urllib.error.HTTPError(u, 404, "not on board", {}, None)
+        return u, (j.get("title") or "") + ".\n" + (j.get("descriptionPlain") or strip_html(j.get("descriptionHtml") or ""))
+    sr = re.search(r"jobs\.smartrecruiters\.com/([\w-]+)/(\d+)", u)
+    if sr:
+        d, _ = get(f"https://api.smartrecruiters.com/v1/companies/{sr[1]}/postings/{sr[2]}", as_json=True)
+        sec = (d.get("jobAd") or {}).get("sections") or {}
+        return u, strip_html(d.get("name", "") + ".\n" + "\n".join((v or {}).get("text", "") for v in sec.values()))
+    page, _ = get(u + ("&" if "?" in u else "?") + "in_iframe=1" if "icims.com" in u else u, timeout=20)
+    if "ultipro." in u:                                  # UKG: description is a JSON string inside the page
+        m = re.search(r'"Description"\s*:\s*"((?:\\.|[^"\\])*)"', page)
+        if m:
+            return u, strip_html(json.loads('"' + m[1] + '"'))
+    if re.search(r"(?i)(no longer (accepting|available)|position (has been )?(filled|closed)|job (is )?(closed|expired)|page not found)", page[:20000]):
+        raise urllib.error.HTTPError(u, 410, "closed", {}, None)
+    return u, (strip_html(_ld_json(page)) or strip_html(page))
+
+def sentences(text):
+    text = re.sub(r"https?://\S+", "", text or "")
+    out = []
+    for l in re.split(r"\n|(?<=[.;!?])\s+(?=[A-Z•\-])", text):
+        l = re.sub(r"\s+", " ", l).strip(" -•*·▪●\t")
+        if l:
+            out.append(l)
+    return out
+
+# --- stated work term ---
+MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+FR_MONTHS = {"janvier": "jan", "février": "feb", "fevrier": "feb", "mars": "mar", "avril": "apr", "mai": "may", "juin": "jun",
+             "juillet": "jul", "août": "aug", "aout": "aug", "septembre": "sep", "octobre": "oct", "novembre": "nov", "décembre": "dec"}
+TERM_LINE = re.compile(r"(?i)\b(winter|hiver|summer|été|fall|autumn|automne|spring|printemps)\b\s*(20\d\d)?|\bjan(uary|vier)?\b.{0,40}\b(20\d\d|apr|avr|may|mai|jun|aug|sep|dec)|\b\d{1,2}\s*\+?\s*(-|–|to|or)?\s*\d{0,2}\s*-?\s*(months?|mois)\b|\bduration\b|\bdurée\b|work term|start date|date de début")
+
+def month_spans(text):
+    """Length in months of each 'January - April' / 'Jan 4th - Apr 30th' span."""
+    t = text.lower()
+    for fr, en in FR_MONTHS.items():
+        t = t.replace(fr, en)
+    names = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+    out = []
+    for a, b in re.findall(names + r"(?:\s+\d{1,2}(?:st|nd|rd|th)?)?,?\s*(?:20\d\d)?\s*(?:-|–|—|to|through|until|au|à)\s*" + names, t):
+        out.append((MONTHS.index(b) - MONTHS.index(a)) % 12 + 1)
+    return out
+
+TERM_CTX = re.compile(r"(?i)intern|co-?op|stage|stagiaire|term|duration|durée|role|position|contract|placement|program|work")
+
+def page_term(lines):
+    """Lines stating the work term. A bare 'N months' counts only beside a word like internship/term/role."""
+    hits = []
+    for l in lines:
+        if not (8 < len(l) < 300) or not TERM_LINE.search(l):
+            continue
+        only_months = not re.search(r"(?i)winter|hiver|summer|été|fall|automne|spring|printemps|jan(uary|vier)?|duration|durée|start date|work term", l)
+        if only_months and not TERM_CTX.search(l):
+            continue
+        hits.append(l)
+    return hits[:4]
+
+def page_term_skip(term_lines):
+    """True when the page states a term and it clearly isn't a 4-month Winter/January one."""
+    t = " ".join(term_lines)
+    if not t:
+        return False
+    if term_skip(t):
+        return True
+    spans = month_spans(t)
+    return bool(spans) and min(spans) > CFG["term"]["months"] + 1   # Jan 4 - Apr 30 = 4; Jan - Sept = 9
+
+# --- requirement blockers for a first-year student (French is NOT a blocker: Karim speaks it) ---
+NUM = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "un": 1, "une": 1, "deux": 2, "trois": 3}
+SOFT = re.compile(r"(?i)\b(asset|nice to have|nice-to-have|bonus|preferred|is a plus|a plus\b|an advantage|atout|souhait)")
+EXP = re.compile(r"(?i)\b(\d{1,2}|an?|one|two|three|four|five)\s*(?:\+|plus)?\s*(?:(?:-|–|to|or)\s*\d{1,2}\s*\+?\s*)?years?\s+(?:of\s+)?((?:[\w+#./-]+\s+){0,4}?)(?:hands-on\s+)?experience\b"
+                 r"|\b(\d{1,2}|un|une|deux|trois)\s*\+?\s*ans?\s+(?:d['’]|de\s+)exp[ée]rience")
+STANDING = re.compile(r"(?i)\b(third|fourth|fifth|final|3rd|4th|5th)[- ]year\b|\byear\s*[345]\b(?!\d)|\b(2nd|second)[- ]year\s+(or|and)\s+(above|higher|beyond|up)"
+                      r"|\bcompleted\s+(at\s+least\s+|a\s+minimum\s+of\s+)?(two|2|three|3|four|4)\s+(full\s+|academic\s+)?years\b"
+                      r"|\bminimum\s+of\s+(two|2|three|3)\s+years\s+of\s+(study|university|post-?secondary|undergrad)"
+                      r"|\b(3e|4e|troisième|quatrième|dernière)\s+année|\bterminé\s+(au\s+moins\s+)?(deux|2|trois|3)\s+(ans|années)")
+ANY_YEAR = re.compile(r"(?i)\b(first|1st|any year|all years|première)\b")
+GRAD = re.compile(r"(?i)\b(graduat\w*|convocation|class of|diplômé\w*|diplomation)\b")
+
+def blocker(lines):
+    """Reason string if the posting asks for 1+ years of experience, a graduation date, or 3rd/4th-year standing."""
+    grad_year = CFG.get("grad_year", 2031)
+    for l in lines:
+        if len(l) > 400:
+            continue
+        for m in EXP.finditer(l):
+            n = (m[1] or m[3] or "").lower()
+            n = NUM.get(n, int(n) if n.isdigit() else 0)
+            between = (m[2] or "").lower()
+            if n >= 1 and not SOFT.search(l) and not re.search(r"(university|study|studies|school|program|degree|college|education)", between):
+                return "reqs:experience", l
+        if STANDING.search(l) and not ANY_YEAR.search(l):
+            return "reqs:year-standing", l
+        if GRAD.search(l):
+            # 'recent graduates' only when students aren't also invited ("our student and new graduate programs" is fine)
+            if re.search(r"(?i)\b(recent(ly)?\s+graduat\w*|graduated\s+(within|in the (last|past)))", l) and not re.search(r"(?i)\bstudents?\b|co-?op|intern", l):
+                return "reqs:graduation", l
+            years = [int(y) for y in re.findall(r"\b(20[2-4]\d)\b", l)]
+            if years:
+                later = re.search(r"(?i)or (later|after|beyond)|and (later|beyond)|onwards?|at the earliest|ou plus tard|ou après", l)
+                if later:
+                    if min(years) > grad_year:
+                        return "reqs:graduation", l
+                elif not (min(years) <= grad_year <= max(years)):
+                    return "reqs:graduation", l
+    return None, None
+
+REQ_HEAD = re.compile(r"(?i)^(requirements?|qualifications?|(minimum|basic|required|preferred) qualifications|what (you|we)('ll)? (bring|need|look\w* for)|who you are|about you|you have|must[- ]haves?|skills|your profile|profil( recherché)?|exigences|compétences)\b")
+REQ_LINE = re.compile(r"(?i)\b(require|must|you have|you'll need|you will need|experience (with|in)|knowledge of|familiar|proficien|degree|enrol|pursuing|year|student|bachelor|master|phd|gpa|graduat|french|english|bilingual|citizen|clearance|eligible|legally)\b")
+
+def focus_jd(lines, term_lines, n=None):
+    """~500 chars for Claude: stated term first, then requirement/qualification lines."""
+    n = n or CFG["jd_chars"]
+    req, in_req = [], 0
+    for l in lines:
+        if REQ_HEAD.search(l) and len(l) < 60:
+            in_req = 12
+            continue
+        if 12 < len(l) < 260 and (in_req or REQ_LINE.search(l)):
+            req.append(l)
+        in_req = max(0, in_req - 1)
+    parts = (["Term: " + " / ".join(dict.fromkeys(t[:110] for t in term_lines))] if term_lines else ["Term: not stated"])
+    total = len(parts[0])
+    for l in dict.fromkeys(req):
+        if total > n:
+            break
+        parts.append(l); total += len(l) + 3
+    return " | ".join(parts)[:n]
+
+def enrich(p):
+    """Read the posting page; set jd (term + requirements), drop reason, or ru (requirements unknown)."""
+    full = p.get("_full")
+    try:
+        if not full:
+            final, full = page_text(p["u"]) if p["u"] else ("", "")
+            if final and "coawp.com/go" in p["u"]:
+                p["u"] = final
     except urllib.error.HTTPError as e:
         if e.code in (404, 410):
             p["dead"] = True
+            return p
+        full = ""
     except Exception:
-        pass
+        full = ""
+    lines = sentences(full)
+    if len(" ".join(lines)) < 200:                     # nothing usable came back
+        p["ru"] = True
+        p["jd"] = p.get("jd") or ""
+        return p
+    tl = page_term(lines)
+    if tl and not p["term"]:
+        p["term"] = tl[0][:80]
+    if page_term_skip(tl):
+        p["drop"] = "term(page)"
+        return p
+    why, line = blocker(lines)
+    if why:
+        p["drop"] = why
+        p["drop_line"] = line[:160]
+        return p
+    p["jd"] = focus_jd(lines, tl)
     return p
 
 
@@ -498,14 +673,15 @@ def cmd_fetch():
     with ThreadPoolExecutor(8) as ex:
         new = list(ex.map(enrich, new))
     dead = sum(1 for p in new if p.get("dead"))
-    keep = []
+    keep, page_drops = [], []
     for p in new:
+        p.pop("_full", None)
         if p.get("dead"):
             continue
-        jd_pairs = re.findall(r"(?i)\b(winter|summer|fall|spring|hiver|été|automne)\s+(20\d\d)\b", p["jd"])
-        other_only = jd_pairs and not re.search(r"(?i)\b(winter|hiver)\s+%d\b|january\s+%d" % (CFG["term"]["year"], CFG["term"]["year"]), p["jd"])
-        if other_only or (not p["term"] and term_skip(p["jd"]) and not re.search(r"(?i)winter|january|\b4[- ]month", p["jd"])):
-            skipped["term(jd)"] = skipped.get("term(jd)", 0) + 1
+        why = p.pop("drop", None)
+        if why:
+            skipped[why] = skipped.get(why, 0) + 1
+            page_drops.append({"c": p["c"], "t": p["t"], "why": why, "line": p.pop("drop_line", ""), "u": p["u"]})
             continue
         keep.append(p)
     pool = pending + keep
@@ -521,7 +697,9 @@ def cmd_fetch():
     for p in batch["items"]:
         seen.setdefault(hk(p["k"]), TODAY.isoformat())
     save("state/seen.json", seen)
-    batch["stats"] = {"fetched": counts, "dropped": skipped, "dead": dead, "in_batch": len(batch["items"]), "waiting": len(pool[room:])}
+    batch["stats"] = {"fetched": counts, "dropped": skipped, "dead": dead, "in_batch": len(batch["items"]), "waiting": len(pool[room:]),
+                      "req_unknown": sum(1 for p in batch["items"] if p.get("ru"))}
+    batch["page_drops"] = batch.get("page_drops", []) + page_drops   # what the page rules removed, and the line why
     save(bpath, batch)
     write_prompt(batch)
     # keep only recent batches
@@ -540,8 +718,8 @@ def cmd_fetch():
 def write_prompt(batch):
     lines = [f"# batch {batch['date']}: {len(batch['items'])} candidates  (id | company | title | location [class] | term | posted | key lines)"]
     for p in batch["items"]:
-        flag = " no-sponsor" if p.get("no_sponsor") else ""
-        jd = (p["jd"] or "-")[:120] if p["lc"] == "us" else (p["jd"] or "-")[:CFG.get("jd_chars_for_claude", 200)]
+        flag = (" no-sponsor" if p.get("no_sponsor") else "") + (" requirements-unknown(max S)" if p.get("ru") else "")
+        jd = (p["jd"] or "-")[:120] if p["lc"] == "us" else (p["jd"] or "-")[:CFG.get("jd_chars_for_claude", 500)]
         lines.append(f'{p["id"]} | {p["c"]} | {p["t"]} | {p["l"]} [{p["lc"]}{flag}] | {p["term"] or "-"} | {p["d"] or "-"} | {jd}')
     open(P("out", "batches", batch["date"] + ".txt"), "w").write("\n".join(lines) + "\n")
 
@@ -563,6 +741,10 @@ def cmd_finalize(scores_path, batch_paths):
         except ValueError:
             continue
         p["v"], p["why"] = parts[2][:1].upper(), parts[3][:140]
+        if p.get("ru"):  # the posting page couldn't be read: cap at Stretch
+            p["v"] = "S" if p["v"] == "A" else p["v"]
+            if "requirements unknown" not in p["why"].lower():
+                p["why"] = ("requirements unknown; " + p["why"])[:140]
         scored.append(p)
     unscored = len(by_id) - len(scored)
     fits = [p for p in scored if p["v"] in "AS" and p["fit"] >= CFG["fit_threshold"]]
@@ -583,6 +765,8 @@ def cmd_finalize(scores_path, batch_paths):
         for p in us:
             L.append(f"- [{p['fit']}/10] {p['c']} - {p['t']} ({p['l']}) {p['u']}" + (" (says no sponsorship)" if p.get("no_sponsor") else ""))
     for d, st in stats.items():
+        if st.get("req_unknown"):
+            L.append(f"{d}: {st['req_unknown']} posting page(s) couldn't be read (marked 'requirements unknown', capped at Stretch).")
         L.append(f"\n{d}: scanned {st.get('fetched')} | dropped by rules {st.get('dropped')} | dead pages {st.get('dead')} | scored {st.get('in_batch')} | waiting for later batches {st.get('waiting')}")
     if unscored:
         L.append(f"Not scored: {unscored} (they won't come back automatically).")

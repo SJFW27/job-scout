@@ -6,7 +6,7 @@
  },
  "max_age_days": 45,
  "fit_threshold": 7,
- "jd_chars": 400,
+ "jd_chars": 500,
  "sources": {
   "simplify": "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
   "cti_negarprh": "https://raw.githubusercontent.com/negarprh/Canadian-Tech-Internships-2027/main/README.md",
@@ -28,5 +28,7 @@
   "Engineering"
  ],
  "max_score_per_run": 120,
- "batch_keep_days": 7
+ "batch_keep_days": 7,
+ "jd_chars_for_claude": 500,
+ "grad_year": 2031
 }
