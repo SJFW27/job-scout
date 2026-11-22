@@ -1,0 +1,32 @@
+{
+ "term": {
+  "season": "Winter",
+  "year": 2027,
+  "months": 4
+ },
+ "max_age_days": 45,
+ "fit_threshold": 7,
+ "jd_chars": 400,
+ "sources": {
+  "simplify": "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
+  "cti_negarprh": "https://raw.githubusercontent.com/negarprh/Canadian-Tech-Internships-2027/main/README.md",
+  "coawp_tech": "https://raw.githubusercontent.com/coawp-com/Canadian-Tech-Internships-2027/main/README.md",
+  "coawp_eng": "https://raw.githubusercontent.com/coawp-com/Canadian-Engineering-Internships-2027/main/README.md",
+  "interninsider": "https://newsletter.interninsider.me/"
+ },
+ "coawp_sections": [
+  "Software Engineering",
+  "AI & Machine Learning",
+  "Data & Analytics",
+  "Electrical & Computer",
+  "Computer",
+  "Electrical",
+  "Robotics",
+  "Mechatronics",
+  "Embedded",
+  "Hardware",
+  "Engineering"
+ ],
+ "max_score_per_run": 120,
+ "batch_keep_days": 7
+}
