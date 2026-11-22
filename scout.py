@@ -112,6 +112,8 @@ def months_in(text):
 def term_skip(term_text):
     """True only when a term is stated and it clearly isn't the target term."""
     t = (term_text or "").lower()
+    for fr, en in (("hiver", "winter"), ("été", "summer"), ("ete ", "summer "), ("automne", "fall"), ("printemps", "spring")):
+        t = t.replace(fr, en)
     seasons = re.findall(r"(winter|summer|fall|autumn|spring)\s*(?:/\s*\w+\s*)?(20\d\d)?", t)
     if seasons:
         target_s, target_y = CFG["term"]["season"].lower(), str(CFG["term"]["year"])
@@ -121,6 +123,18 @@ def term_skip(term_text):
     if ms and min(ms) > CFG["term"]["months"]:
         return True
     return False
+
+def url_term_skip(url):
+    """The posting link often names its term (Summer-2027, Hiver-2027). A different season+year there is a clear Skip."""
+    from urllib.parse import unquote
+    t = re.sub(r"[-_/+.?=&]+", " ", unquote(url or "")).lower()
+    for fr, en in (("hiver", "winter"), ("automne", "fall"), ("printemps", "spring")):
+        t = t.replace(fr, en)
+    pairs = re.findall(r"\b(winter|summer|fall|autumn|spring)\s+(20\d\d)\b", t)
+    if not pairs:
+        return False
+    target = (CFG["term"]["season"].lower(), str(CFG["term"]["year"]))
+    return target not in pairs and not re.search(r"\bjan(uary)?\s+%s\b" % target[1], t)
 
 def too_old(posted):
     return posted is not None and (TODAY - posted).days > CFG["max_age_days"]
@@ -138,6 +152,8 @@ def clear_skip(p):
         return "field/level"
     if term_skip(p["term"] + " " + p["t"]):
         return "term"
+    if url_term_skip(p["u"]):
+        return "term(link)"
     if p["d"] and too_old(dt.date.fromisoformat(p["d"])):
         return "old"
     return None
@@ -385,8 +401,11 @@ def src_interninsider():
             continue
         title, company, loc = mm.groups()
         out.append(make("interninsider", company, title, loc, "", TODAY, html.unescape(href.group(1))))
-    state["last"] = url
-    save("state/interninsider.json", state)
+    if out:
+        state["last"] = url
+        save("state/interninsider.json", state)
+    else:
+        note("interninsider", ok=f"0 jobs parsed from {url} (promo issue or new layout); will retry")
     return out
 
 
@@ -397,10 +416,26 @@ def enrich(p):
     if not u or p["jd"]:
         return p
     try:
-        m = WD.match(u)
+        m = WD.match(u.split("?")[0])
         if m:
-            d, _ = get(f"https://{m[1]}.{m[2]}.myworkdayjobs.com/wday/cxs/{m[1]}/{m[3]}/job/{m[4]}", as_json=True)
-            p["jd"] = trim_jd((d.get("jobPostingInfo") or {}).get("jobDescription", ""))
+            d, _ = get(f"https://{m[1]}.{m[2]}.myworkdayjobs.com/wday/cxs/{m[1]}/{m[3]}/job/{m[4]}", as_json=True,
+                       headers={"Accept": "application/json", "Accept-Language": "en-US"})
+            info = d.get("jobPostingInfo") or {}
+            p["jd"] = trim_jd(info.get("title", "") + ". " + info.get("jobDescription", ""), 1200)
+            return p
+        bb = re.match(r"https://([\w-]+)\.bamboohr\.com/careers/(\d+)", u)
+        if bb:
+            d, _ = get(f"https://{bb[1]}.bamboohr.com/careers/{bb[2]}/detail", as_json=True, headers={"Accept": "application/json"})
+            jo = (d.get("result") or {}).get("jobOpening") or {}
+            p["jd"] = trim_jd(jo.get("jobOpeningName", "") + ". " + jo.get("description", ""), 1200)
+            return p
+        oc = re.match(r"(https://[\w.-]+\.oraclecloud\.com)/hcmUI/CandidateExperience/[\w-]+/sites/([\w-]+)/job/(\d+)", u)
+        if oc:
+            api = (f"{oc[1]}/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails?expand=all&onlyData=true"
+                   f"&finder=ById;Id=%22{oc[3]}%22,siteNumber={oc[2]}")
+            d, _ = get(api, as_json=True, headers={"Accept": "application/json"})
+            it = (d.get("items") or [{}])[0]
+            p["jd"] = trim_jd(" ".join(str(it.get(k) or "") for k in ("Title", "ExternalDescriptionStr", "ExternalResponsibilitiesStr", "ExternalQualificationsStr")), 1200)
             return p
         gh = re.search(r"greenhouse\.io/(?:embed/job_app\?for=)?([\w-]+)/jobs/(\d+)", u)
         if gh:
@@ -467,7 +502,9 @@ def cmd_fetch():
     for p in new:
         if p.get("dead"):
             continue
-        if not p["term"] and term_skip(p["jd"]) and not re.search(r"(?i)winter|january|\b4[- ]month", p["jd"]):
+        jd_pairs = re.findall(r"(?i)\b(winter|summer|fall|spring|hiver|été|automne)\s+(20\d\d)\b", p["jd"])
+        other_only = jd_pairs and not re.search(r"(?i)\b(winter|hiver)\s+%d\b|january\s+%d" % (CFG["term"]["year"], CFG["term"]["year"]), p["jd"])
+        if other_only or (not p["term"] and term_skip(p["jd"]) and not re.search(r"(?i)winter|january|\b4[- ]month", p["jd"])):
             skipped["term(jd)"] = skipped.get("term(jd)", 0) + 1
             continue
         keep.append(p)
@@ -504,7 +541,7 @@ def write_prompt(batch):
     lines = [f"# batch {batch['date']}: {len(batch['items'])} candidates  (id | company | title | location [class] | term | posted | key lines)"]
     for p in batch["items"]:
         flag = " no-sponsor" if p.get("no_sponsor") else ""
-        jd = (p["jd"] or "-")[:200] if p["lc"] == "us" else (p["jd"] or "-")
+        jd = (p["jd"] or "-")[:120] if p["lc"] == "us" else (p["jd"] or "-")[:CFG.get("jd_chars_for_claude", 200)]
         lines.append(f'{p["id"]} | {p["c"]} | {p["t"]} | {p["l"]} [{p["lc"]}{flag}] | {p["term"] or "-"} | {p["d"] or "-"} | {jd}')
     open(P("out", "batches", batch["date"] + ".txt"), "w").write("\n".join(lines) + "\n")
 
