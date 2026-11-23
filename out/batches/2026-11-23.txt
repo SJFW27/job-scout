@@ -1,0 +1,1 @@
+# batch 2026-11-23: 0 candidates  (id | company | title | location [class] | term | posted | key lines)
